@@ -13,6 +13,9 @@ from libc.stdlib cimport malloc, free
 
 from ..neighbors._quad_tree cimport _QuadTree
 
+from mpi4py cimport MPI
+# cimport mpi4py.libmpi as libmpi
+
 cnp.import_array()
 
 
@@ -42,7 +45,8 @@ cdef extern from "time.h":
     double CLOCKS_PER_SEC
 
 
-cdef float compute_gradient(float[:] val_P,
+# cdef float .. noexcept nogil
+def compute_gradient(float[:] val_P,
                             float[:, :] pos_reference,
                             cnp.int64_t[:] neighbors,
                             cnp.int64_t[:] indptr,
@@ -52,7 +56,8 @@ cdef float compute_gradient(float[:] val_P,
                             int dof,
                             long start,
                             long stop,
-                            bint compute_error) noexcept nogil:
+                            bint compute_error,
+                            MPI.Comm comm):
     # Having created the tree, calculate the gradient
     # in two components, the positive and negative forces
     cdef:
@@ -73,8 +78,11 @@ cdef float compute_gradient(float[:] val_P,
 
     if take_timing:
         t1 = clock()
-    sQ = compute_gradient_negative(pos_reference, neg_f, qt, dof, theta, start,
-                                   stop)
+    sQ = compute_gradient_negative(pos_reference, neg_f, qt, dof, theta, start, stop)
+
+    # reduce sQ between processors
+    sQ = comm.allreduce(sQ)
+
     if take_timing:
         t2 = clock()
         printf("[t-SNE] Computing negative gradient: %e ticks\n", ((float) (t2 - t1)))
@@ -82,14 +90,14 @@ cdef float compute_gradient(float[:] val_P,
     if take_timing:
         t1 = clock()
     error = compute_gradient_positive(val_P, pos_reference, neighbors, indptr,
-                                      pos_f, n_dimensions, dof, sQ, start,
+                                      pos_f, n_dimensions, dof, sQ, start, stop,
                                       qt.verbose, compute_error)
     if take_timing:
         t2 = clock()
         printf("[t-SNE] Computing positive gradient: %e ticks\n",
                ((float) (t2 - t1)))
     # with nogil:
-    for i in range(start, n_samples):
+    for i in range(start, stop):
         for ax in range(n_dimensions):
             coord = (i - start) * n_dimensions + ax
             tot_force[i - start, ax] = pos_f[coord] - (neg_f[coord] / sQ)
@@ -108,6 +116,7 @@ cdef float compute_gradient_positive(float[:] val_P,
                                      int dof,
                                      double sum_Q,
                                      cnp.int64_t start,
+                                     cnp.int64_t stop,
                                      int verbose,
                                      bint compute_error) noexcept nogil:
     # Sum over the following expression for i not equal to j
@@ -134,7 +143,7 @@ cdef float compute_gradient_positive(float[:] val_P,
     # Define private buffer variables
     buff = <float *> malloc(sizeof(float) * n_dimensions)
 
-    for i in range(start, n_samples):
+    for i in range(start, stop):
         # Init the gradient vector
         for ax in range(n_dimensions):
             pos_f[(i - start) * n_dimensions + ax] = 0.0
@@ -262,6 +271,7 @@ def gradient(float[:] val_P,
              int verbose,
              int rank,
              int size,
+             MPI.Comm comm,
              int dof=1,
              bint compute_error=1):
     # This function is designed to be called from external Python
@@ -297,7 +307,7 @@ def gradient(float[:] val_P,
     # start = 0
     # stop = n
     C = compute_gradient(val_P, pos_output, neighbors, indptr, forces,
-                         qt, theta, dof, start, stop, compute_error)
+                         qt, theta, dof, start, stop, compute_error, comm)
 
     if verbose > 10:
         # XXX: format hack to workaround lack of `const char *` type

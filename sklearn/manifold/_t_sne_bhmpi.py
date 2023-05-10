@@ -167,6 +167,7 @@ def _kl_divergence_bh(
         verbose,
         rank=comm.Get_rank(),
         size=comm.Get_size(),
+        comm=comm,
         dof=degrees_of_freedom,
         compute_error=compute_error,
     )
@@ -282,7 +283,8 @@ def _gradient_descent(
         kwargs["compute_error"] = check_convergence or i == n_iter - 1
 
         # sync data
-        # comm.bcast(P, root=0)
+        comm.Bcast(p, root=0)
+        
         gradi = np.zeros((n_samples // size, n_components), dtype=np.float32)
 
         error = _kl_divergence_bh(p, gradi, *args, comm=comm, **kwargs)
@@ -291,7 +293,7 @@ def _gradient_descent(
         if kwargs["compute_error"]:
             error = comm.reduce(error, op=MPI.SUM, root=0)
         
-        print(rank, i, gradi.shape)
+        # print(rank, i, gradi.shape)
         grad = None
         if rank == 0:
             grad = np.zeros((size, n_samples//size, n_components), dtype=np.float32)
@@ -327,21 +329,21 @@ def _gradient_descent(
                 if error < best_error:
                     best_error = error
                     best_iter = i
-                elif i - best_iter > n_iter_without_progress:
-                    if verbose >= 2:
-                        print(
-                            "[t-SNE] Iteration %d: did not make any progress "
-                            "during the last %d episodes. Finished."
-                            % (i + 1, n_iter_without_progress)
-                        )
-                    break
-                if grad_norm <= min_grad_norm:
-                    if verbose >= 2:
-                        print(
-                            "[t-SNE] Iteration %d: gradient norm %f. Finished."
-                            % (i + 1, grad_norm)
-                        )
-                    break
+                # elif i - best_iter > n_iter_without_progress:
+                #     if verbose >= 2:
+                #         print(
+                #             "[t-SNE] Iteration %d: did not make any progress "
+                #             "during the last %d episodes. Finished."
+                #             % (i + 1, n_iter_without_progress)
+                #         )
+                #     break
+                # if grad_norm <= min_grad_norm:
+                #     if verbose >= 2:
+                #         print(
+                #             "[t-SNE] Iteration %d: gradient norm %f. Finished."
+                #             % (i + 1, grad_norm)
+                #         )
+                #     break
         comm.Barrier()
 
     return p, error, i
@@ -428,7 +430,7 @@ def _tsne(
 _EXPLORATION_N_ITER = 250
 
 # Control the number of iterations between progress checks
-_N_ITER_CHECK = 50
+_N_ITER_CHECK = 1
 
 def tsne(
         X,
