@@ -90,9 +90,9 @@ def _joint_probabilities_nn(distances, desired_perplexity, verbose):
         print("[t-SNE] Computed conditional probabilities in {:.3f}s".format(duration))
     return P
 
-# TODO
 def _kl_divergence_bh(
     params,
+    grad,
     P,
     degrees_of_freedom,
     n_samples,
@@ -156,7 +156,6 @@ def _kl_divergence_bh(
     neighbors = P.indices.astype(np.int64, copy=False)
     indptr = P.indptr.astype(np.int64, copy=False)
 
-    grad = np.zeros(X_embedded.shape, dtype=np.float32)
     error = _barnes_hut_tsne_mpi.gradient(
         val_P,
         X_embedded,
@@ -166,19 +165,18 @@ def _kl_divergence_bh(
         angle,
         n_components,
         verbose,
-        comm.Get_rank(),
+        rank=comm.Get_rank(),
         size=comm.Get_size(),
         dof=degrees_of_freedom,
         compute_error=compute_error,
     )
     c = 2.0 * (degrees_of_freedom + 1.0) / degrees_of_freedom
-    grad = grad.ravel()
+    # grad = grad.ravel()
     grad *= c
-
-    return error, grad
+    
+    return error
 
 def _gradient_descent(
-    objective,
     p0,
     it,
     n_iter,
@@ -259,173 +257,103 @@ def _gradient_descent(
     i : int
         Last iteration.
     """
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
     if args is None:
         args = []
     if kwargs is None:
         kwargs = {}
+    P, degrees_of_freedom, n_samples, n_components = args
 
     p = p0.copy().ravel()
     update = np.zeros_like(p)
     gains = np.ones_like(p)
     error = np.finfo(float).max
-    best_error = np.finfo(float).max
-    best_iter = i = it
 
-    tic = time()
+    if rank == 0:
+        best_error = np.finfo(float).max
+        best_iter = i = it
+        tic = time()
+    
     for i in range(it, n_iter):
         check_convergence = (i + 1) % n_iter_check == 0
         # only compute the error when needed
         kwargs["compute_error"] = check_convergence or i == n_iter - 1
 
-        error, grad = objective(p, *args, comm=comm, **kwargs)
+        # sync data
+        # comm.bcast(P, root=0)
+        gradi = np.zeros((n_samples // size, n_components), dtype=np.float32)
 
-        inc = update * grad < 0.0
-        dec = np.invert(inc)
-        gains[inc] += 0.2
-        gains[dec] *= 0.8
-        np.clip(gains, min_gain, np.inf, out=gains)
-        grad *= gains
-        update = momentum * update - learning_rate * grad
-        p += update
+        error = _kl_divergence_bh(p, gradi, *args, comm=comm, **kwargs)
 
-        if check_convergence:
-            toc = time()
-            duration = toc - tic
-            tic = toc
-            grad_norm = linalg.norm(grad)
+        # collect error and grad
+        if kwargs["compute_error"]:
+            error = comm.reduce(error, op=MPI.SUM, root=0)
+        
+        print(rank, i, gradi.shape)
+        grad = None
+        if rank == 0:
+            grad = np.zeros((size, n_samples//size, n_components), dtype=np.float32)
+        comm.Gather(gradi, grad, root=0)
 
-            if verbose >= 2:
-                print(
-                    "[t-SNE] Iteration %d: error = %.7f,"
-                    " gradient norm = %.7f"
-                    " (%s iterations in %0.3fs)"
-                    % (i + 1, error, grad_norm, n_iter_check, duration)
-                )
+        # perform update
+        if rank == 0:
+            grad = grad.reshape(n_samples * n_components)
+            inc = update * grad < 0.0
+            dec = np.invert(inc)
+            gains[inc] += 0.2
+            gains[dec] *= 0.8
+            np.clip(gains, min_gain, np.inf, out=gains)
+            grad *= gains
+            update = momentum * update - learning_rate * grad
+            p += update
 
-            if error < best_error:
-                best_error = error
-                best_iter = i
-            elif i - best_iter > n_iter_without_progress:
+            if check_convergence:
+                # sync error
+                toc = time()
+                duration = toc - tic
+                tic = toc
+                grad_norm = linalg.norm(grad)
+
                 if verbose >= 2:
                     print(
-                        "[t-SNE] Iteration %d: did not make any progress "
-                        "during the last %d episodes. Finished."
-                        % (i + 1, n_iter_without_progress)
+                        "[t-SNE] Iteration %d: error = %.7f,"
+                        " gradient norm = %.7f"
+                        " (%s iterations in %0.3fs)"
+                        % (i + 1, error, grad_norm, n_iter_check, duration)
                     )
-                break
-            if grad_norm <= min_grad_norm:
-                if verbose >= 2:
-                    print(
-                        "[t-SNE] Iteration %d: gradient norm %f. Finished."
-                        % (i + 1, grad_norm)
-                    )
-                break
+
+                if error < best_error:
+                    best_error = error
+                    best_iter = i
+                elif i - best_iter > n_iter_without_progress:
+                    if verbose >= 2:
+                        print(
+                            "[t-SNE] Iteration %d: did not make any progress "
+                            "during the last %d episodes. Finished."
+                            % (i + 1, n_iter_without_progress)
+                        )
+                    break
+                if grad_norm <= min_grad_norm:
+                    if verbose >= 2:
+                        print(
+                            "[t-SNE] Iteration %d: gradient norm %f. Finished."
+                            % (i + 1, grad_norm)
+                        )
+                    break
+        comm.Barrier()
 
     return p, error, i
-
-def trustworthiness(X, X_embedded, *, n_neighbors=5, metric="euclidean"):
-    r"""Indicate to what extent the local structure is retained.
-
-    The trustworthiness is within [0, 1]. It is defined as
-
-    .. math::
-
-        T(k) = 1 - \frac{2}{nk (2n - 3k - 1)} \sum^n_{i=1}
-            \sum_{j \in \mathcal{N}_{i}^{k}} \max(0, (r(i, j) - k))
-
-    where for each sample i, :math:`\mathcal{N}_{i}^{k}` are its k nearest
-    neighbors in the output space, and every sample j is its :math:`r(i, j)`-th
-    nearest neighbor in the input space. In other words, any unexpected nearest
-    neighbors in the output space are penalised in proportion to their rank in
-    the input space.
-
-    Parameters
-    ----------
-    X : {array-like, sparse matrix} of shape (n_samples, n_features) or \
-        (n_samples, n_samples)
-        If the metric is 'precomputed' X must be a square distance
-        matrix. Otherwise it contains a sample per row.
-
-    X_embedded : {array-like, sparse matrix} of shape (n_samples, n_components)
-        Embedding of the training data in low-dimensional space.
-
-    n_neighbors : int, default=5
-        The number of neighbors that will be considered. Should be fewer than
-        `n_samples / 2` to ensure the trustworthiness to lies within [0, 1], as
-        mentioned in [1]_. An error will be raised otherwise.
-
-    metric : str or callable, default='euclidean'
-        Which metric to use for computing pairwise distances between samples
-        from the original input space. If metric is 'precomputed', X must be a
-        matrix of pairwise distances or squared distances. Otherwise, for a list
-        of available metrics, see the documentation of argument metric in
-        `sklearn.pairwise.pairwise_distances` and metrics listed in
-        `sklearn.metrics.pairwise.PAIRWISE_DISTANCE_FUNCTIONS`. Note that the
-        "cosine" metric uses :func:`~sklearn.metrics.pairwise.cosine_distances`.
-
-        .. versionadded:: 0.20
-
-    Returns
-    -------
-    trustworthiness : float
-        Trustworthiness of the low-dimensional embedding.
-
-    References
-    ----------
-    .. [1] Jarkko Venna and Samuel Kaski. 2001. Neighborhood
-           Preservation in Nonlinear Projection Methods: An Experimental Study.
-           In Proceedings of the International Conference on Artificial Neural Networks
-           (ICANN '01). Springer-Verlag, Berlin, Heidelberg, 485-491.
-
-    .. [2] Laurens van der Maaten. Learning a Parametric Embedding by Preserving
-           Local Structure. Proceedings of the Twelth International Conference on
-           Artificial Intelligence and Statistics, PMLR 5:384-391, 2009.
-    """
-    n_samples = X.shape[0]
-    if n_neighbors >= n_samples / 2:
-        raise ValueError(
-            f"n_neighbors ({n_neighbors}) should be less than n_samples / 2"
-            f" ({n_samples / 2})"
-        )
-    dist_X = pairwise_distances(X, metric=metric)
-    if metric == "precomputed":
-        dist_X = dist_X.copy()
-    # we set the diagonal to np.inf to exclude the points themselves from
-    # their own neighborhood
-    np.fill_diagonal(dist_X, np.inf)
-    ind_X = np.argsort(dist_X, axis=1)
-    # `ind_X[i]` is the index of sorted distances between i and other samples
-    ind_X_embedded = (
-        NearestNeighbors(n_neighbors=n_neighbors)
-        .fit(X_embedded)
-        .kneighbors(return_distance=False)
-    )
-
-    # We build an inverted index of neighbors in the input space: For sample i,
-    # we define `inverted_index[i]` as the inverted index of sorted distances:
-    # inverted_index[i][ind_X[i]] = np.arange(1, n_sample + 1)
-    inverted_index = np.zeros((n_samples, n_samples), dtype=int)
-    ordered_indices = np.arange(n_samples + 1)
-    inverted_index[ordered_indices[:-1, np.newaxis], ind_X] = ordered_indices[1:]
-    ranks = (
-        inverted_index[ordered_indices[:-1, np.newaxis], ind_X_embedded] - n_neighbors
-    )
-    t = np.sum(ranks[ranks > 0])
-    t = 1.0 - t * (
-        2.0 / (n_samples * n_neighbors * (2.0 * n_samples - 3.0 * n_neighbors - 1.0))
-    )
-    return t
 
 
 def _tsne(
     P,
-    Z,
     degrees_of_freedom,
     n_samples,
     X_embedded,
     n_components=2,
     n_iter=1000,
-    neighbors=None,
     n_iter_check=1,
     min_grad_norm=1e-7,
     learning_rate=100,
@@ -441,6 +369,9 @@ def _tsne(
     # we use is batch gradient descent with two stages:
     # * initial optimization with early exaggeration and momentum at 0.5
     # * final optimization with momentum at 0.8
+
+    rank = comm.Get_rank() if comm else 0
+
     params = X_embedded.ravel()
 
     opt_args = {
@@ -449,22 +380,21 @@ def _tsne(
         "min_grad_norm": min_grad_norm,
         "learning_rate": learning_rate,
         "verbose": verbose,
-        "kwargs": dict(),
+        "kwargs": dict(
+            angle=angle,
+            verbose=verbose,
+        ),
         "args": [P, degrees_of_freedom, n_samples, n_components],
         "n_iter_without_progress": exploration_n_iter,
         "n_iter": exploration_n_iter,
         "momentum": 0.5,
     }
-    obj_func = _kl_divergence_bh
-    opt_args["kwargs"]["angle"] = angle
-    # Repeat verbose argument for _kl_divergence_bh
-    opt_args["kwargs"]["verbose"] = verbose
 
     # Learning schedule (part 1): do 250 iteration with lower momentum but
     # higher learning rate controlled via the early exaggeration parameter
     P *= early_exaggeration
-    params, kl_divergence, it = _gradient_descent(obj_func, params, **opt_args, comm=comm)
-    if verbose:
+    params, kl_divergence, it = _gradient_descent(params, **opt_args, comm=comm)
+    if rank == 0 and verbose:
         print(
             "[t-SNE] KL divergence after %d iterations with early exaggeration: %f"
             % (it + 1, kl_divergence)
@@ -479,21 +409,19 @@ def _tsne(
         opt_args["it"] = it + 1
         opt_args["momentum"] = 0.8
         opt_args["n_iter_without_progress"] = exploration_n_iter
-        params, kl_divergence, it = _gradient_descent(obj_func, params, **opt_args, comm=comm)
+        params, kl_divergence, it = _gradient_descent(params, **opt_args, comm=comm)
 
     # Save the final number of iterations
-    n_iter_ = it
+    # n_iter_ = it
 
-    if verbose:
-        print(
-            "[t-SNE] KL divergence after %d iterations: %f"
-            % (it + 1, kl_divergence)
-        )
+    if rank == 0:
+        if verbose:
+            print(
+                "[t-SNE] KL divergence after %d iterations: %f"
+                % (it + 1, kl_divergence)
+            )
 
-    X_embedded = params.reshape(n_samples, n_components)
-    # self.kl_divergence_ = kl_divergence
-
-    Z.data = X_embedded.data
+        X_embedded.data = params.reshape(n_samples, n_components).data
 
 
 # Control the number of exploration iterations with early_exaggeration on
@@ -547,77 +475,84 @@ def tsne(
 
     n_samples = X.shape[0]
 
-    neighbors_nn = None
-    # Compute the number of nearest neighbors to find.
-    # LvdM uses 3 * perplexity as the number of neighbors.
-    # In the event that we have very small # of points
-    # set the neighbors to n - 1.
-    n_neighbors = min(n_samples - 1, int(3.0 * perplexity + 1))
+    if rank == 0:
+        # Compute the number of nearest neighbors to find.
+        # LvdM uses 3 * perplexity as the number of neighbors.
+        # In the event that we have very small # of points
+        # set the neighbors to n - 1.
+        n_neighbors = min(n_samples - 1, int(3.0 * perplexity + 1))
 
-    if verbose:
-        print("[t-SNE] Computing {} nearest neighbors...".format(n_neighbors))
+        if verbose:
+            print("[t-SNE] Computing {} nearest neighbors...".format(n_neighbors))
 
-    # Find the nearest neighbors for every point
-    knn = NearestNeighbors(
-        algorithm="auto",
-        n_jobs=n_jobs,
-        n_neighbors=n_neighbors,
-        metric=metric,
-        metric_params=metric_params,
-    )
-    t0 = time()
-    knn.fit(X)
-    duration = time() - t0
-    if verbose:
-        print(
-            "[t-SNE] Indexed {} samples in {:.3f}s...".format(
-                n_samples, duration
+        # Find the nearest neighbors for every point
+        knn = NearestNeighbors(
+            algorithm="auto",
+            n_jobs=n_jobs,
+            n_neighbors=n_neighbors,
+            metric=metric,
+            metric_params=metric_params,
+        )
+        t0 = time()
+        knn.fit(X)
+        duration = time() - t0
+        if verbose:
+            print(
+                "[t-SNE] Indexed {} samples in {:.3f}s...".format(
+                    n_samples, duration
+                )
             )
-        )
 
-    t0 = time()
-    distances_nn = knn.kneighbors_graph(mode="distance")
-    duration = time() - t0
-    if verbose:
-        print(
-            "[t-SNE] Computed neighbors for {} samples in {:.3f}s...".format(
-                n_samples, duration
+        t0 = time()
+        distances_nn = knn.kneighbors_graph(mode="distance")
+        duration = time() - t0
+        if verbose:
+            print(
+                "[t-SNE] Computed neighbors for {} samples in {:.3f}s...".format(
+                    n_samples, duration
+                )
             )
-        )
 
-    # Free the memory used by the ball_tree
-    del knn
+        # Free the memory used by the ball_tree
+        del knn
 
-    # knn return the euclidean distance but we need it squared
-    # to be consistent with the 'exact' method. Note that the
-    # the method was derived using the euclidean method as in the
-    # input space. Not sure of the implication of using a different
-    # metric.
-    distances_nn.data **= 2
+        # knn return the euclidean distance but we need it squared
+        # to be consistent with the 'exact' method. Note that the
+        # the method was derived using the euclidean method as in the
+        # input space. Not sure of the implication of using a different
+        # metric.
+        distances_nn.data **= 2
 
-    # compute the joint probability distribution for the input space
-    P = _joint_probabilities_nn(distances_nn, perplexity, verbose)
+        # compute the joint probability distribution for the input space
+        P = _joint_probabilities_nn(distances_nn, perplexity, verbose)
+    else:
+        P = None
+    P = comm.bcast(P, root=0)
 
-    if isinstance(init, np.ndarray):
-        X_embedded = init
-    elif init == "pca":
-        pca = PCA(
-            n_components=n_components,
-            svd_solver="randomized",
-            random_state=random_state,
-        )
-        # Always output a numpy array, no matter what is configured globally
-        pca.set_output(transform="default")
-        X_embedded = pca.fit_transform(X).astype(np.float32, copy=False)
-        # PCA is rescaled so that PC1 has standard deviation 1e-4 which is
-        # the default value for random initialization. See issue #18018.
-        X_embedded = X_embedded / np.std(X_embedded[:, 0]) * 1e-4
-    elif init == "random":
-        # The embedding is initialized with iid samples from Gaussians with
-        # standard deviation 1e-4.
-        X_embedded = 1e-4 * random_state.standard_normal(
-            size=(n_samples, n_components)
-        ).astype(np.float32)
+    if rank == 0:
+        if isinstance(init, np.ndarray):
+            X_embedded = init
+        elif init == "pca":
+            pca = PCA(
+                n_components=n_components,
+                svd_solver="randomized",
+                random_state=random_state,
+            )
+            # Always output a numpy array, no matter what is configured globally
+            pca.set_output(transform="default")
+            X_embedded = pca.fit_transform(X).astype(np.float32, copy=False)
+            # PCA is rescaled so that PC1 has standard deviation 1e-4 which is
+            # the default value for random initialization. See issue #18018.
+            X_embedded = X_embedded / np.std(X_embedded[:, 0]) * 1e-4
+        elif init == "random":
+            # The embedding is initialized with iid samples from Gaussians with
+            # standard deviation 1e-4.
+            X_embedded = 1e-4 * random_state.standard_normal(
+                size=(n_samples, n_components)
+            ).astype(np.float32)
+    else:
+        X_embedded = np.empty((n_samples, n_components), dtype=np.float32)
+    comm.Bcast(X_embedded, root=0)
 
     # Degrees of freedom of the Student's t-distribution. The suggestion
     # degrees_of_freedom = n_components - 1 comes from
@@ -627,13 +562,11 @@ def tsne(
 
     _tsne(
         P,
-        Z,
         degrees_of_freedom,
         n_samples,
         X_embedded,
         n_components=n_components,
         n_iter=n_iter,
-        neighbors=neighbors_nn,
         n_iter_check=_N_ITER_CHECK,
         min_grad_norm=min_grad_norm,
         learning_rate=learning_rate_,
@@ -643,3 +576,5 @@ def tsne(
         verbose=verbose,
         comm=comm,
     )
+
+    Z.data = X_embedded.data

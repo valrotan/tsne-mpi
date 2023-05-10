@@ -13,6 +13,7 @@ from mpi4py import MPI
 # Initialize MPI
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
+size = comm.Get_size()
 
 # Get data
 if rank == 0:
@@ -38,7 +39,8 @@ comm.Bcast(X, root=0)
 
 # Z = tsne.fit_transform(X[:1000])
 
-N = 1000
+# number of samples must be divisible by size
+N = 1000 - (1000 % size)
 
 Z = np.zeros((N, 2), dtype='float32')
 
@@ -59,3 +61,5 @@ tsne(
 if rank == 0:
     plt.scatter(*Z.T, s=2)
     plt.savefig('out/tsne.png')
+
+MPI.Finalize()

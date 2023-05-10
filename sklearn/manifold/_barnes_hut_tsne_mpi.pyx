@@ -68,8 +68,8 @@ cdef float compute_gradient(float[:] val_P,
     if qt.verbose > 11:
         printf("[t-SNE] Allocating %li elements in force arrays\n",
                n_samples * n_dimensions * 2)
-    cdef float* neg_f = <float*> malloc(sizeof(float) * n_samples * n_dimensions)
-    cdef float* pos_f = <float*> malloc(sizeof(float) * n_samples * n_dimensions)
+    cdef float* neg_f = <float*> malloc(sizeof(float) * (stop - start) * n_dimensions)
+    cdef float* pos_f = <float*> malloc(sizeof(float) * (stop - start) * n_dimensions)
 
     if take_timing:
         t1 = clock()
@@ -91,8 +91,8 @@ cdef float compute_gradient(float[:] val_P,
     # with nogil:
     for i in range(start, n_samples):
         for ax in range(n_dimensions):
-            coord = i * n_dimensions + ax
-            tot_force[i, ax] = pos_f[coord] - (neg_f[coord] / sQ)
+            coord = (i - start) * n_dimensions + ax
+            tot_force[i - start, ax] = pos_f[coord] - (neg_f[coord] / sQ)
 
     free(neg_f)
     free(pos_f)
@@ -137,7 +137,7 @@ cdef float compute_gradient_positive(float[:] val_P,
     for i in range(start, n_samples):
         # Init the gradient vector
         for ax in range(n_dimensions):
-            pos_f[i * n_dimensions + ax] = 0.0
+            pos_f[(i - start) * n_dimensions + ax] = 0.0
         # Compute the positive interaction for the nearest neighbors
         for k in range(indptr[i], indptr[i+1]):
             j = neighbors[k]
@@ -156,7 +156,7 @@ cdef float compute_gradient_positive(float[:] val_P,
                 qij = qij / sum_Q
                 C += pij * log(max(pij, FLOAT32_TINY) / max(qij, FLOAT32_TINY))
             for ax in range(n_dimensions):
-                pos_f[i * n_dimensions + ax] += dij * buff[ax]
+                pos_f[(i - start) * n_dimensions + ax] += dij * buff[ax]
 
     free(buff)
     
@@ -234,7 +234,7 @@ cdef double compute_gradient_negative(float[:, :] pos_reference,
         if take_timing:
             t3 = clock()
         for ax in range(n_dimensions):
-            neg_f[i * n_dimensions + ax] = neg_force[ax]
+            neg_f[(i - start) * n_dimensions + ax] = neg_force[ax]
         if take_timing:
             dta += t2 - t1
             dtb += t3 - t2
@@ -270,11 +270,16 @@ def gradient(float[:] val_P,
     cdef float C
     cdef int n
     n = pos_output.shape[0]
+ 
+    cdef long start, stop
+    start = n * rank // size
+    stop = n * (rank + 1) // size
+ 
     assert val_P.itemsize == 4
     assert pos_output.itemsize == 4
     assert forces.itemsize == 4
     m = "Forces array and pos_output shapes are incompatible"
-    assert n == forces.shape[0], m
+    assert stop - start == forces.shape[0], m
     m = "Pij and pos_output shapes are incompatible"
     assert n == indptr.shape[0] - 1, m
     if verbose > 10:
@@ -289,9 +294,8 @@ def gradient(float[:] val_P,
         # and -Werror=format-security
         printf("[t-SNE] Computing gradient\n%s", EMPTY_STRING)
 
-    cdef long start, stop
-    start = n * rank // size
-    stop = n * (rank + 1) // size
+    # start = 0
+    # stop = n
     C = compute_gradient(val_P, pos_output, neighbors, indptr, forces,
                          qt, theta, dof, start, stop, compute_error)
 
