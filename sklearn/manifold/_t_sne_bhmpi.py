@@ -268,9 +268,13 @@ def _gradient_descent(
     P, degrees_of_freedom, n_samples, n_components = args
 
     p = p0.copy().ravel()
-    update = np.zeros_like(p)
-    gains = np.ones_like(p)
+    pi = np.zeros((n_samples // size * n_components), dtype=np.float32)
+    updatei = np.zeros((n_samples // size * n_components), dtype=np.float32)
+    update = np.zeros((n_samples * n_components), dtype=np.float32)
+    gains = np.ones((n_samples // size * n_components), dtype=np.float32)
     error = np.finfo(float).max
+
+    comm.Scatter(p, pi, root=0)
 
     if rank == 0:
         best_error = np.finfo(float).max
@@ -283,7 +287,7 @@ def _gradient_descent(
         kwargs["compute_error"] = check_convergence or i == n_iter - 1
 
         # sync data
-        comm.Bcast(p, root=0)
+        # comm.Bcast(p, root=0)
         
         gradi = np.zeros((n_samples // size, n_components), dtype=np.float32)
 
@@ -294,28 +298,32 @@ def _gradient_descent(
             error = comm.reduce(error, op=MPI.SUM, root=0)
         
         # print(rank, i, gradi.shape)
-        grad = None
-        if rank == 0:
-            grad = np.zeros((size, n_samples//size, n_components), dtype=np.float32)
-        comm.Gather(gradi, grad, root=0)
 
         # perform update
-        if rank == 0:
-            grad = grad.reshape(n_samples * n_components)
-            inc = update * grad < 0.0
-            dec = np.invert(inc)
-            gains[inc] += 0.2
-            gains[dec] *= 0.8
-            np.clip(gains, min_gain, np.inf, out=gains)
-            grad *= gains
-            update = momentum * update - learning_rate * grad
-            p += update
+        gradi = gradi.ravel()
+        inc = updatei * gradi < 0.0
+        dec = np.invert(inc)
+        gains[inc] += 0.2
+        gains[dec] *= 0.8
+        np.clip(gains, min_gain, np.inf, out=gains)
+        gradi *= gains
+        updatei = momentum * updatei - learning_rate * gradi
+        pi += updatei
 
-            if check_convergence:
+        comm.Allgather(pi, p)
+
+        
+        if check_convergence:
+            grad = None
+            if rank == 0:
+                grad = np.zeros((size, n_samples//size, n_components), dtype=np.float32)
+            comm.Gather(gradi, grad, root=0)
+
+            if rank == 0:
                 # sync error
                 toc = time()
                 duration = toc - tic
-                tic = toc
+                
                 grad_norm = linalg.norm(grad)
 
                 if verbose >= 2:
@@ -329,22 +337,24 @@ def _gradient_descent(
                 if error < best_error:
                     best_error = error
                     best_iter = i
-                # elif i - best_iter > n_iter_without_progress:
-                #     if verbose >= 2:
-                #         print(
-                #             "[t-SNE] Iteration %d: did not make any progress "
-                #             "during the last %d episodes. Finished."
-                #             % (i + 1, n_iter_without_progress)
-                #         )
-                #     break
-                # if grad_norm <= min_grad_norm:
-                #     if verbose >= 2:
-                #         print(
-                #             "[t-SNE] Iteration %d: gradient norm %f. Finished."
-                #             % (i + 1, grad_norm)
-                #         )
-                #     break
-        comm.Barrier()
+                
+                tic = time()
+            # elif i - best_iter > n_iter_without_progress:
+            #     if verbose >= 2:
+            #         print(
+            #             "[t-SNE] Iteration %d: did not make any progress "
+            #             "during the last %d episodes. Finished."
+            #             % (i + 1, n_iter_without_progress)
+            #         )
+            #     break
+            # if grad_norm <= min_grad_norm:
+            #     if verbose >= 2:
+            #         print(
+            #             "[t-SNE] Iteration %d: gradient norm %f. Finished."
+            #             % (i + 1, grad_norm)
+            #         )
+            #     break
+        # comm.Barrier()
 
     return p, error, i
 
@@ -430,7 +440,7 @@ def _tsne(
 _EXPLORATION_N_ITER = 250
 
 # Control the number of iterations between progress checks
-_N_ITER_CHECK = 1
+_N_ITER_CHECK = 50
 
 def tsne(
         X,
