@@ -244,6 +244,7 @@ extension_config = {
     "manifold": [
         {"sources": ["_utils.pyx"], "include_np": True},
         {"sources": ["_barnes_hut_tsne.pyx"], "include_np": True},
+        {"sources": ["_barnes_hut_tsne_mpi.pyx"], "include_np": True},
     ],
     "metrics": [
         {"sources": ["_pairwise_fast.pyx"], "include_np": True},
